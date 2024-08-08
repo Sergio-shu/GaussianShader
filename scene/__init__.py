@@ -88,7 +88,8 @@ class Scene:
                                 "brdf_mlp",
                                 "iteration_" + str(self.loaded_iter),
                                 "brdf_mlp.hdr")
-                self.gaussians.brdf_mlp = load_env(fn, scale=1.0)
+                self.gaussians.brdf_mlp = load_env(fn, scale=0.0, bias=0.75)
+                #self.gaussians.brdf_mlp = load_env(fn, scale=1.0, bias=0.0)
                 print(f"Load envmap from: {fn}")
         else:
             self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent)
@@ -96,10 +97,38 @@ class Scene:
     def save(self, iteration):
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
         self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
+        self.gaussians.save_ply(
+            os.path.join(point_cloud_path, "point_cloud_diffuse.ply"),
+            viewer_fmt=True,
+            base_color_type='diffuse',
+        )
+        self.gaussians.save_ply(
+            os.path.join(point_cloud_path, "point_cloud_diffuse_non_metal.ply"),
+            viewer_fmt=True,
+            base_color_type='diffuse_non_metal',
+        )
+        self.gaussians.save_ply(
+            os.path.join(point_cloud_path, "point_cloud_specular.ply"),
+            viewer_fmt=True,
+            base_color_type='specular',
+        )
+        self.gaussians.save_ply(
+            os.path.join(point_cloud_path, "point_cloud_normals1.ply"),
+            viewer_fmt=True,
+            base_color_type='diffuse',
+            normals_type=1,
+        )
+        self.gaussians.save_ply(
+            os.path.join(point_cloud_path, "point_cloud_normals2.ply"),
+            viewer_fmt=True,
+            base_color_type='diffuse',
+            normals_type=2,
+        )
         if self.gaussians.brdf:
             brdf_mlp_path = os.path.join(self.model_path, f"brdf_mlp/iteration_{iteration}/brdf_mlp.hdr")
             mkdir_p(os.path.dirname(brdf_mlp_path))
             save_env_map(brdf_mlp_path, self.gaussians.brdf_mlp)
+
     def getTrainCameras(self, scale=1.0):
         return self.train_cameras[scale]
 

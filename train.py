@@ -12,7 +12,21 @@
 import os
 import torch
 from random import randint
-from utils.loss_utils import l1_loss, ssim, predicted_normal_loss, delta_normal_loss, zero_one_loss
+from utils.loss_utils import (
+    l1_loss,
+    ssim,
+    predicted_normal_loss,
+    delta_normal_loss,
+    zero_one_loss,
+    first_order_edge_aware_loss,
+    entropy_loss,
+    tv_loss,
+    neutral_color_loss,
+    avg_light_intensity_loss,
+    metallic_loss,
+    roughness_loss,
+    ambient_occlusion_loss,
+)
 from gaussian_renderer import render, network_gui, render_lighting
 import sys
 from scene import Scene, GaussianModel
@@ -24,20 +38,38 @@ from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 import time
+
+from scene.cameras import Camera
+
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
 except ImportError:
     TENSORBOARD_FOUND = False
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations):
+# import pydevd_pycharm
+# pydevd_pycharm.settrace('localhost', port=9999, stdoutToServer=True, stderrToServer=True, suspend=False)
+
+
+def training(
+        dataset, opt, pipe, testing_iterations, saving_iterations,
+        hdr_path=None,
+):
     tb_writer = prepare_output_and_logger(dataset)
-    gaussians = GaussianModel(dataset.sh_degree, dataset.brdf_dim, dataset.brdf_mode, dataset.brdf_envmap_res)
+    gaussians = GaussianModel(
+        dataset.sh_degree,
+        dataset.brdf_dim,
+        dataset.brdf_mode,
+        dataset.brdf_envmap_res,
+        hdr_path=hdr_path,
+    )
 
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
 
-    bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
+    #bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
+    #bg_color = [0, 0, 0]
+    bg_color = [1, 1, 1]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
     iter_start = torch.cuda.Event(enable_timing = True)
@@ -81,22 +113,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
 
         # Render
         render_pkg = render(viewpoint_cam, gaussians, pipe, background, debug=False)
-        image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
-        losses_extra = {}
-        if pipe.brdf and iteration > opt.normal_reg_from_iter:
-            if iteration<opt.normal_reg_util_iter:
-                losses_extra['predicted_normal'] = predicted_normal_loss(render_pkg["normal"], render_pkg["normal_ref"], render_pkg["alpha"])
-            losses_extra['zero_one'] = zero_one_loss(render_pkg["alpha"])
-            if "delta_normal_norm" not in render_pkg.keys() and opt.lambda_delta_reg>0: assert()
-            if "delta_normal_norm" in render_pkg.keys():
-                losses_extra['delta_reg'] = delta_normal_loss(render_pkg["delta_normal_norm"], render_pkg["alpha"])
 
-        # Loss
-        gt_image = viewpoint_cam.original_image.cuda()
-        Ll1 = l1_loss(image, gt_image)
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
-        for k in losses_extra.keys():
-            loss += getattr(opt, f'lambda_{k}')* losses_extra[k]
+        image, viewspace_point_tensor, visibility_filter, radii = (
+            render_pkg["render"],
+            render_pkg["viewspace_points"],
+            render_pkg["visibility_filter"],
+            render_pkg["radii"],
+        )
+
+        loss, losses_extra = _calculate_loss(
+            iteration, opt, pipe, render_pkg, viewpoint_cam,
+            gaussians.brdf_mlp.base,
+            gaussians,
+        )
         loss.backward()
 
         iter_end.record()
@@ -114,8 +143,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
             gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
 
             # Log and save
+            gt_image = viewpoint_cam.original_image.cuda()
             losses_extra['psnr'] = psnr(image, gt_image).mean()
-            training_report(tb_writer, iteration, Ll1, loss, losses_extra, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
+
+            training_report(tb_writer, iteration, loss, losses_extra, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -140,7 +171,96 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations):
             if pipe.brdf and pipe.brdf_mode=="envmap":
                 gaussians.brdf_mlp.clamp_(min=0.0, max=1.0)
 
-def prepare_output_and_logger(args):    
+
+def _calculate_loss(iteration, opt, pipe, render_pkg, viewpoint_camera: Camera, env_light, gaussians):
+    image, viewspace_point_tensor, visibility_filter, radii = (
+        render_pkg["render"],
+        render_pkg["viewspace_points"],
+        render_pkg["visibility_filter"],
+        render_pkg["radii"],
+    )
+    gt_image = viewpoint_camera.original_image.cuda()
+
+    losses_extra = {}
+
+    if pipe.brdf and iteration > opt.normal_reg_from_iter:
+        if iteration < opt.normal_reg_util_iter:
+            losses_extra['predicted_normal'] = predicted_normal_loss(render_pkg["normal"], render_pkg["normal_ref"],
+                                                                     render_pkg["alpha"])
+        losses_extra['zero_one'] = entropy_loss(render_pkg["alpha"])
+        #losses_extra['zero_one'] = zero_one_loss(render_pkg["alpha"])
+
+        if "delta_normal_norm" in render_pkg.keys():
+            losses_extra['delta_reg'] = delta_normal_loss(render_pkg["delta_normal_norm"], render_pkg["alpha"])
+        else:
+            assert opt.lambda_delta_reg == 0
+
+    if opt.lambda_opacity_zero_one > 0:
+        losses_extra['opacity_zero_one'] = entropy_loss(gaussians.get_opacity)
+
+    if opt.lambda_diffuse_smooth > 0:
+        diffuse = render_pkg["diffuse"]
+        #image_mask = viewpoint_camera.gt_alpha_mask.cuda()
+
+        loss_diffuse_smooth = first_order_edge_aware_loss(diffuse, gt_image)
+        #loss_diffuse_smooth = first_order_edge_aware_loss(diffuse * image_mask, gt_image)
+        losses_extra["diffuse_smooth"] = loss_diffuse_smooth
+
+    if opt.lambda_specular_smooth > 0:
+        specular = render_pkg["specular"]
+        #image_mask = viewpoint_camera.gt_alpha_mask.cuda()
+
+        #loss_specular_smooth = first_order_edge_aware_loss(specular * image_mask, gt_image)
+        loss_specular_smooth = first_order_edge_aware_loss(specular, gt_image)
+
+        losses_extra["specular_smooth"] = loss_specular_smooth
+
+    if opt.lambda_env_neutral > 0:
+        specular_env = render_pkg["specular_env_color"]
+        #image_mask = viewpoint_camera.gt_alpha_mask.cuda()
+
+        loss_neutral_color = neutral_color_loss(specular_env)
+        #loss_neutral_color = neutral_color_loss(specular_env * image_mask)
+        losses_extra["env_neutral"] = loss_neutral_color
+
+    if opt.lambda_env_smooth > 0:
+        loss_env_smooth = tv_loss(env_light.permute(3, 0, 1, 2))
+        losses_extra["env_smooth"] = loss_env_smooth
+
+    if opt.lambda_specular_color_smooth > 0:
+        specular_color = render_pkg["specular_env_color"]
+        #image_mask = viewpoint_camera.gt_alpha_mask.cuda()
+        #loss_specular_color_smooth = first_order_edge_aware_loss(specular_color * image_mask, gt_image)
+        loss_specular_color_smooth = first_order_edge_aware_loss(specular_color, gt_image)
+        losses_extra["specular_color_smooth"] = loss_specular_color_smooth
+
+    if opt.lambda_avg_light_intensity > 0:
+        loss_light_intensity = avg_light_intensity_loss(env_light)
+        losses_extra["avg_light_intensity"] = loss_light_intensity
+
+    if opt.lambda_metallic > 0:
+        losses_extra["metallic"] = metallic_loss(gaussians)
+
+    if opt.lambda_roughness > 0:
+        losses_extra["roughness"] = roughness_loss(gaussians)
+
+    if opt.lambda_ambient_occlusion > 0:
+        losses_extra["ambient_occlusion"] = ambient_occlusion_loss(gaussians)
+
+    # Loss
+
+    render_image_l1 = l1_loss(image, gt_image)
+    losses_extra['l1'] = render_image_l1
+
+    loss = (1.0 - opt.lambda_dssim) * render_image_l1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+
+    for k in losses_extra.keys():
+        loss += getattr(opt, f'lambda_{k}') * losses_extra[k]
+
+    return loss, losses_extra
+
+
+def prepare_output_and_logger(args):
     if not args.model_path:
         if os.getenv('OAR_JOB_ID'):
             unique_str=os.getenv('OAR_JOB_ID')
@@ -162,9 +282,9 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1, loss, losses_extra, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs):
+def training_report(tb_writer, iteration, loss, losses_extra, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs):
     if tb_writer:
-        tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
+        tb_writer.add_scalar('train_loss_patches/l1_loss', losses_extra['l1'].item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
         tb_writer.add_scalar('iter_time', elapsed, iteration)
         for k in losses_extra.keys():
@@ -230,9 +350,10 @@ if __name__ == "__main__":
     parser.add_argument('--ip', type=str, default="127.0.0.1")
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[1, 100, 7_000, 15_000, 30_000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[1, 100, 7_000, 15_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument('--hdr_path', type=str, default=None)
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
@@ -244,7 +365,14 @@ if __name__ == "__main__":
     # Start GUI server, configure and run training
     network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations)
+    training(
+        lp.extract(args),
+        op.extract(args),
+        pp.extract(args),
+        args.test_iterations,
+        args.save_iterations,
+        hdr_path=args.hdr_path,
+    )
 
     # All done
     print("\nTraining complete.")

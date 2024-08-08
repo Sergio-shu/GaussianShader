@@ -47,7 +47,11 @@ def loadCam(args, id, cam_info, resolution_scale):
         gt_normal_image = resized_normal_image_rgb[:3, ...]
     else:
         gt_normal_image = None
+
     loaded_mask = None
+    if resized_image_rgb.shape[0] == 4:
+        loaded_mask = resized_image_rgb[3:4, ...]
+        assert loaded_mask.min() >= 0 and loaded_mask.max() <= 1
 
 
     return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 

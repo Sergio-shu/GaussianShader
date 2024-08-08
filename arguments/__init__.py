@@ -108,10 +108,22 @@ class OptimizationParams(ParamGroup):
         self.roughness_lr = 0.0002
         self.normal_reg_from_iter = 0
         self.normal_reg_util_iter = 30_000
-        self.lambda_zero_one = 1e-3
+        self.lambda_l1 = 1.0
         self.lambda_predicted_normal = 2e-1
-        self.lambda_delta_reg = 1e-3
+        self.lambda_delta_reg = 1e-2
+        self.lambda_zero_one = 1e-1
+        self.lambda_opacity_zero_one = 0  #1e-1
+        self.lambda_diffuse_smooth = 0  #1e-1
+        self.lambda_specular_smooth = 0  #1e-1
+        self.lambda_specular_color_smooth = 0  #1e-1
+        self.lambda_env_smooth = 0
+        self.lambda_env_neutral = 0  #1e-1
+        self.lambda_avg_light_intensity = 0  #1e-1
+        self.lambda_metallic = 0  #1.0
+        self.lambda_roughness = 0  #1e-3
+        self.lambda_ambient_occlusion = 0  #1e-2
         self.fix_brdf_lr = 0
+
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

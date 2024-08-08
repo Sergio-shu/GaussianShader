@@ -21,10 +21,19 @@ from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation, get_minimum_axis, flip_align_view
 import open3d as o3d
-from scene.NVDIFFREC import create_trainable_env_rnd, load_env
+from scene.NVDIFFREC import create_trainable_env_rnd, load_trainable_env, load_env
+from scene.NVDIFFREC.light import EnvironmentLight
+
 
 class GaussianModel:
-    def __init__(self, sh_degree : int, brdf_dim : int, brdf_mode : str, brdf_envmap_res: int):
+    def __init__(
+            self,
+            sh_degree: int,
+            brdf_dim: int,
+            brdf_mode: str,
+            brdf_envmap_res: int,
+            hdr_path=None,
+    ):
 
         def build_covariance_from_scaling_rotation(scaling, scaling_modifier, rotation):
             L = build_scaling_rotation(scaling_modifier * scaling, rotation)
@@ -58,7 +67,15 @@ class GaussianModel:
         self._roughness = torch.empty(0)
 
         if self.brdf:
-            self.brdf_mlp = create_trainable_env_rnd(self.brdf_envmap_res, scale=0.0, bias=0.8)
+            if hdr_path is None:
+                self.brdf_mlp = create_trainable_env_rnd(
+                    self.brdf_envmap_res,
+                    scale=0.75 - 0.25, bias=0.25,
+                    #scale=0, bias=0.35,
+                )
+            else:
+                print('Loading HDR from path', hdr_path)
+                self.brdf_mlp = load_trainable_env(self.brdf_envmap_res, hdr_path)
         else:
             self.brdf_mlp = None    
         
@@ -111,7 +128,7 @@ class GaussianModel:
         normal_axis = normal_axis
         normal_axis, positive = flip_align_view(normal_axis, dir_pp_normalized)
         delta_normal1 = self._normal  # (N, 3) 
-        delta_normal2 = self._normal2 # (N, 3) 
+        delta_normal2 = self._normal2 # (N, 3)
         delta_normal = torch.stack([delta_normal1, delta_normal2], dim=-1) # (N, 3, 2)
         idx = torch.where(positive, 0, 1).long()[:,None,:].repeat(1, 3, 1) # (N, 3, 1)
         delta_normal = torch.gather(delta_normal, index=idx, dim=-1).squeeze(-1) # (N, 3)
@@ -123,8 +140,26 @@ class GaussianModel:
             return normal
 
     @property
+    def normal1(self):
+        delta_normal = self._normal  # (N, 3)
+        normal_axis = self.get_minimum_axis
+        normal = delta_normal + normal_axis
+        normal = normal / normal.norm(dim=1, keepdim=True)  # (N, 3)
+
+        return normal
+
+    @property
+    def normal2(self):
+        delta_normal = self._normal2  # (N, 3)
+        normal_axis = self.get_minimum_axis
+        normal = delta_normal + normal_axis
+        normal = normal / normal.norm(dim=1, keepdim=True)  # (N, 3)
+
+        return normal
+
+    @property
     def get_diffuse(self):
-        return self._features_dc
+        return self.diffuse_activation(self._features_dc)
 
     @property
     def get_specular(self):
@@ -154,17 +189,16 @@ class GaussianModel:
             features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
             features[:, :3, 0 ] = fused_color
             features[:, 3:, 1:] = 0.0
-        elif (self.brdf_mode=="envmap" and self.brdf_dim==0):
+        elif self.brdf_mode=="envmap":
             fused_color = torch.tensor(np.asarray(pcd.colors)).float().cuda()
             features = torch.zeros((fused_color.shape[0], self.brdf_dim + 3)).float().cuda()
+            epsilon = 1e-1
+            fused_color = inverse_sigmoid(fused_color / (1 + 2 * epsilon) + epsilon)
             features[:, :3 ] = fused_color
             features[:, 3: ] = 0.0
-        elif self.brdf_mode=="envmap" and self.brdf_dim>0:
-            fused_color = torch.tensor(np.asarray(pcd.colors)).float().cuda()
-            features = torch.zeros((fused_color.shape[0], 3)).float().cuda()
-            features[:, :3 ] = fused_color
-            features[:, 3: ] = 0.0
-            features_rest = torch.zeros((fused_color.shape[0], 3, (self.brdf_dim + 1) ** 2)).float().cuda()
+
+            if self.brdf_dim > 0:
+                features_rest = torch.zeros((fused_color.shape[0], 3, (self.brdf_dim + 1) ** 2)).float().cuda()
         else:
             raise NotImplementedError
 
@@ -229,6 +263,17 @@ class GaussianModel:
                 {'params': [self._normal2], 'lr': training_args.normal_lr, "name": "normal2"},
             ])
 
+            with torch.no_grad():
+                epsilon = 1e-1
+                self._specular[:] = torch.rand_like(self._specular)
+                self._specular[:] = inverse_sigmoid(self._specular / (1 + 2 * epsilon) + epsilon)
+
+                self._opacity[:] = inverse_sigmoid(torch.ones_like(self._opacity) * 0.1)
+                #self._opacity[:] = torch.rand_like(self._opacity)
+                #self._opacity[:] = inverse_sigmoid(self._opacity / (1 + 2 * epsilon) + epsilon)
+
+                self.brdf_mlp.base[:] = 0.5
+
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
                                                     lr_final=training_args.position_lr_final*self.spatial_lr_scale,
@@ -287,17 +332,24 @@ class GaussianModel:
             for i in range(self._features_rest.shape[1]*self._features_rest.shape[2]):
                 l.append('f_rest_{}'.format(i))
         else:
-            l.extend(['nx2', 'ny2', 'nz2'])
-            for i in range(self._features_dc.shape[1]):
-                l.append('f_dc_{}'.format(i))
             if viewer_fmt:
+                for i in range(self._features_dc.shape[1]):
+                    l.append('f_dc_{}'.format(i))
                 features_rest_len = 45
-            elif (self.brdf_mode=="envmap" and self.brdf_dim==0):
-                features_rest_len = self._features_rest.shape[1]
-            elif self.brdf_mode=="envmap":
-                features_rest_len = self._features_rest.shape[1]*self._features_rest.shape[2]
-            for i in range(features_rest_len):
-                l.append('f_rest_{}'.format(i))
+                for i in range(features_rest_len):
+                    l.append('f_rest_{}'.format(i))
+            else:
+                l.extend(['nx2', 'ny2', 'nz2'])
+                for i in range(self._features_dc.shape[1]):
+                    l.append('f_dc_{}'.format(i))
+                if viewer_fmt:
+                    features_rest_len = 45
+                elif (self.brdf_mode=="envmap" and self.brdf_dim==0):
+                    features_rest_len = self._features_rest.shape[1]
+                elif self.brdf_mode=="envmap":
+                    features_rest_len = self._features_rest.shape[1]*self._features_rest.shape[2]
+                for i in range(features_rest_len):
+                    l.append('f_rest_{}'.format(i))
         l.append('opacity')
         for i in range(self._scaling.shape[1]):
             l.append('scale_{}'.format(i))
@@ -309,14 +361,29 @@ class GaussianModel:
                 l.append('specular{}'.format(i))
         return l
 
-    def save_ply(self, path, viewer_fmt=False):
+    def save_ply(
+            self,
+            path,
+            viewer_fmt=False,
+            base_color_type='diffuse',
+            normals_type=None,
+    ):
         mkdir_p(os.path.dirname(path))
 
         xyz = self._xyz.detach().cpu().numpy()
         normals = np.zeros_like(xyz) if not self.brdf else self._normal.detach().cpu().numpy()
-        normals2 = self._normal2.detach().cpu().numpy() if (self.brdf) else np.zeros_like(xyz)
-        f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy() if not self.brdf else self._features_dc.detach().cpu().numpy()
-        f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy() if not ((self.brdf and self.brdf_mode=="envmap" and self.brdf_dim==0)) else self._features_rest.detach().cpu().numpy()
+        normals2 = np.zeros_like(xyz) if not self.brdf else self._normal2.detach().cpu().numpy()
+
+        if not self.brdf:
+            f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+        else:
+            f_dc = self._features_dc.detach().cpu().numpy()
+
+        if not ((self.brdf and self.brdf_mode=="envmap" and self.brdf_dim==0)):
+            f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+        else:
+            f_rest = self._features_rest.detach().cpu().numpy()
+
         opacities = self._opacity.detach().cpu().numpy()
         scale = self._scaling.detach().cpu().numpy()
         rotation = self._rotation.detach().cpu().numpy()
@@ -324,9 +391,34 @@ class GaussianModel:
         specular = None if not self.brdf else self._specular.detach().cpu().numpy()
         
         if viewer_fmt:
-            f_dc = 0.5 + (0.5*normals)
+            assert self.brdf
+            from utils.sh_utils import RGB2SH
+
+            if base_color_type == 'diffuse':
+                base_color = self.get_diffuse.detach().cpu().numpy()
+            elif base_color_type =='diffuse_non_metal':
+                base_color, _ = EnvironmentLight.find_diffuse_specular_component(
+                    self.get_diffuse[None, None, ...],
+                    self.get_specular[None, None, ...],
+                )
+                base_color = base_color[0, 0].detach().cpu().numpy()
+            elif base_color_type == 'specular':
+                base_color = self.get_specular.detach().cpu().numpy()
+            else:
+                raise ValueError(f'Base color type {base_color_type} is not supported.')
+
+            f_dc = RGB2SH(base_color)
             f_rest = np.zeros((f_rest.shape[0], 45))
-            normals = np.zeros_like(normals)
+
+            if normals_type is not None:
+                if normals_type == 1:
+                    normals = np.zeros_like(xyz) if not self.brdf else self.normal1.detach().cpu().numpy()
+                elif normals_type == 2:
+                    normals = np.zeros_like(xyz) if not self.brdf else self.normal2.detach().cpu().numpy()
+                else:
+                    raise ValueError(f'Normals type {normals_type} is not supported.')
+            else:
+                normals = np.zeros_like(normals)
 
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes(viewer_fmt)]
 

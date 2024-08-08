@@ -25,6 +25,10 @@ from utils.general_utils import get_minimum_axis
 from scene.NVDIFFREC.util import save_image_raw
 import numpy as np
 
+import pydevd_pycharm
+pydevd_pycharm.settrace('localhost', port=9999, stdoutToServer=True, stderrToServer=True, suspend=False)
+
+
 def render_lightings(model_path, name, iteration, gaussians, sample_num):
     lighting_path = os.path.join(model_path, name, "ours_{}".format(iteration))
     makedirs(lighting_path, exist_ok=True)    
@@ -70,8 +74,12 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
         gaussians = GaussianModel(dataset.sh_degree, dataset.brdf_dim, pipeline.brdf_mode, dataset.brdf_envmap_res)
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
 
-        bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
+        #bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
+        bg_color = [1, 1, 1]
+        #bg_color = [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+
+        gaussians.save_ply(os.path.join(dataset.model_path, 'point_cloud_diffuse.ply'), viewer_fmt=True)
 
         if not skip_train:
              render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background)

@@ -133,13 +133,21 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 diffuse   = pc.get_diffuse # (N, 3) 
                 normal, delta_normal = pc.get_normal(dir_pp_normalized=dir_pp_normalized, return_delta=True) # (N, 3) 
                 delta_normal_norm = delta_normal.norm(dim=1, keepdim=True)
-                specular  = pc.get_specular # (N, 3) 
-                roughness = pc.get_roughness # (N, 1) 
-                color, brdf_pkg = pc.brdf_mlp.shade(gb_pos[None, None, ...], normal[None, None, ...], diffuse[None, None, ...], specular[None, None, ...], roughness[None, None, ...], view_pos[None, None, ...])
+                specular  = pc.get_specular # (N, 3)
+                roughness = pc.get_roughness # (N, 1)
+                color, brdf_pkg = pc.brdf_mlp.shade(
+                    gb_pos[None, None, ...],
+                    normal[None, None, ...],
+                    diffuse[None, None, ...],
+                    specular[None, None, ...],
+                    #roughness[None, None, ...],
+                    view_pos[None, None, ...],
+                )
 
                 colors_precomp = color.squeeze() # (N, 3) 
                 diffuse_color = brdf_pkg['diffuse'].squeeze() # (N, 3) 
                 specular_color = brdf_pkg['specular'].squeeze() # (N, 3) 
+                specular_env_color = brdf_pkg['specular_env'].squeeze() # (N, 3)
 
                 if pc.brdf_dim>0:
                     shs_view = pc.get_brdf_features.view(-1, 3, (pc.brdf_dim+1)**2)
@@ -191,14 +199,19 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             render_extras.update({"normal": normal_normed})
             if delta_normal_norm is not None:
                 render_extras.update({"delta_normal_norm": delta_normal_norm.repeat(1, 3)})
+            render_extras.update({
+                "specular": specular,
+                "ambient_occlusion": specular[:, 0:1].repeat(1, 3),
+                "specular_color": specular_color,
+                "specular_env_color": specular_env_color,
+                "diffuse_color": diffuse_color,
+                "diffuse": diffuse,
+
+            })
             if debug:
                 render_extras.update({
-                    "diffuse": diffuse, 
-                    "specular": specular, 
-                    "roughness": roughness.repeat(1, 3), 
-                    "diffuse_color": diffuse_color, 
-                    "specular_color": specular_color, 
-                    "color_delta": color_delta,  
+                    "roughness": roughness.repeat(1, 3),
+                    "color_delta": color_delta,
                     })
         
         out_extras = {}
@@ -265,4 +278,5 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             "radii": radii, 
     }
     out.update(out_extras)
+
     return out

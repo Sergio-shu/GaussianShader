@@ -15,6 +15,9 @@ from torch.autograd import Variable
 from math import exp
 from utils.image_utils import erode
 import numpy as np
+from kornia.filters import laplacian, spatial_gradient
+from scene.NVDIFFREC.light import EnvironmentLight
+
 
 def l1_loss(network_output, gt):
     return torch.abs((network_output - gt)).mean()
@@ -73,6 +76,14 @@ def zero_one_loss(img):
     val = torch.clamp(img, zero_epsilon, 1 - zero_epsilon)
     loss = torch.mean(torch.log(val) + torch.log(1 - val))
     return loss
+
+
+def entropy_loss(img):
+    zero_epsilon = 1e-3
+    val = torch.clamp(img, zero_epsilon, 1 - zero_epsilon)
+    loss = -torch.mean(val * torch.log(val))
+    return loss
+
 
 def predicted_normal_loss(normal, normal_ref, alpha=None):
     """Computes the predicted normal supervision loss defined in ref-NeRF."""
@@ -136,3 +147,38 @@ def cam_depth2world_point(cam_z, pixel_idx, intrinsic, extrinsic):
     world_xyz = torch.cat([cam_xyz, torch.ones_like(cam_xyz[...,0:1])], axis=-1) @ torch.inverse(extrinsic).transpose(0,1)
     world_xyz = world_xyz[...,:3]
     return world_xyz, cam_xyz
+
+
+def first_order_edge_aware_loss(data, img):
+    return (spatial_gradient(data[None], order=1)[0].abs() * torch.exp(-spatial_gradient(img[None], order=1)[0].abs())).sum(1).mean()
+
+
+def neutral_color_loss(image):
+    return torch.abs(image - image.mean(dim=0, keepdim=True)).mean()
+
+
+def avg_light_intensity_loss(image, avg_intensity=0.5):
+    below_avg = torch.nn.functional.relu(avg_intensity - image)
+    loss = below_avg.sum() / ((below_avg > 0).sum() + 1e-5)
+    return loss
+
+    #return torch.abs(image.mean() - avg_intensity)
+
+
+def tv_loss(depth):
+    # return spatial_gradient(data[None], order=2)[0, :, [0, 2]].abs().sum(1).mean()
+    h_tv = torch.square(depth[..., 1:, :] - depth[..., :-1, :]).mean()
+    w_tv = torch.square(depth[..., :, 1:] - depth[..., :, :-1]).mean()
+    return h_tv + w_tv
+
+
+def metallic_loss(gaussians):
+    return gaussians.get_specular[..., 2].mean()
+
+
+def roughness_loss(gaussians):
+    return (1 - gaussians.get_specular[..., 1]).mean()
+
+
+def ambient_occlusion_loss(gaussians):
+    return gaussians.get_specular[..., 0].mean()
